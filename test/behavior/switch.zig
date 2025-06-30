@@ -1065,3 +1065,24 @@ test "switch on a signed value smaller than the smallest prong value" {
         else => {},
     }
 }
+
+test "switch on packed struct" {
+    const P = packed struct { a: u1, b: u1 };
+
+    const p: P = .{ .a = 0, .b = 0 };
+    switch (p) {
+        .{ .a = 0, .b = 0 } => {},
+        else => return error.TestFailed,
+    }
+    switch (p) {
+        .{ .a = 0, .b = 0 } => {},
+
+        .{ .a = 0, .b = 1 },
+        .{ .a = 1, .b = 0 },
+        .{ .a = 1, .b = 1 },
+        => return error.TestFailed,
+    }
+    switch (p) {
+        inline else => |val| if (val != .{ .a = 0, .b = 0 }) return error.TestFailed,
+    }
+}

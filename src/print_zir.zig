@@ -276,6 +276,8 @@ const Writer = struct {
             .opt_eu_base_ptr_init,
             .restore_err_ret_index_unconditional,
             .restore_err_ret_index_fn_entry,
+            .switch_cond,
+            .switch_cond_ref,
             => try self.writeUnNode(stream, inst),
 
             .ref,
@@ -454,9 +456,7 @@ const Writer = struct {
 
             .error_set_decl => try self.writeErrorSetDecl(stream, inst),
 
-            .switch_block,
-            .switch_block_ref,
-            => try self.writeSwitchBlock(stream, inst),
+            .switch_block => try self.writeSwitchBlock(stream, inst),
 
             .switch_block_err_union => try self.writeSwitchBlockErrUnion(stream, inst),
 
