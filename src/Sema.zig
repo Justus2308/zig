@@ -11862,7 +11862,10 @@ fn zirSwitchBlock(sema: *Sema, block: *Block, inst: Zir.Inst.Index, operand_is_r
     var case_vals = try std.ArrayListUnmanaged(Air.Inst.Ref).initCapacity(gpa, scalar_cases_len + 2 * multi_cases_len);
     defer case_vals.deinit(gpa);
 
-    const special_prong = extra.data.bits.specialProng();
+    var absorbed_items: []const Zir.Inst.Ref = &.{};
+    var absorbed_ranges: []const Zir.Inst.Ref = &.{};
+
+    const special_prong = extra.data.bits.special_prong;
     const special: SpecialProng = switch (special_prong) {
         .none => .{
             .body = &.{},
@@ -11877,6 +11880,26 @@ fn zirSwitchBlock(sema: *Sema, block: *Block, inst: Zir.Inst.Index, operand_is_r
             break :blk .{
                 .body = sema.code.bodySlice(extra_body_start, info.body_len),
                 .end = extra_body_start + info.body_len,
+                .capture = info.capture,
+                .is_inline = info.is_inline,
+                .has_tag_capture = info.has_tag_capture,
+            };
+        },
+        .absorbing_under => blk: {
+            var extra_index = header_extra_index;
+            const items_len = sema.code.extra[extra_index];
+            extra_index += 1;
+            const ranges_len = sema.code.extra[extra_index];
+            extra_index += 1;
+            const info: Zir.Inst.SwitchBlock.ProngInfo = @bitCast(sema.code.extra[extra_index]);
+            extra_index += 1;
+            absorbed_items = sema.code.refSlice(extra_index, items_len);
+            extra_index += items_len;
+            absorbed_ranges = sema.code.refSlice(extra_index, ranges_len * 2);
+            extra_index += ranges_len * 2;
+            break :blk .{
+                .body = sema.code.bodySlice(extra_index, info.body_len),
+                .end = extra_index + info.body_len,
                 .capture = info.capture,
                 .is_inline = info.is_inline,
                 .has_tag_capture = info.has_tag_capture,
@@ -11902,7 +11925,9 @@ fn zirSwitchBlock(sema: *Sema, block: *Block, inst: Zir.Inst.Index, operand_is_r
     var else_error_ty: ?Type = null;
 
     // Validate usage of '_' prongs.
-    if (special_prong == .under and !raw_operand_ty.isNonexhaustiveEnum(zcu)) {
+    if ((special_prong == .under or special_prong == .absorbing_under) and
+        !raw_operand_ty.isNonexhaustiveEnum(zcu))
+    {
         const msg = msg: {
             const msg = try sema.errMsg(
                 src,
@@ -11935,6 +11960,22 @@ fn zirSwitchBlock(sema: *Sema, block: *Block, inst: Zir.Inst.Index, operand_is_r
             empty_enum = seen_enum_fields.len == 0 and !cond_ty.isNonexhaustiveEnum(zcu);
             @memset(seen_enum_fields, null);
             // `range_set` is used for non-exhaustive enum values that do not correspond to any tags.
+
+            for (absorbed_items, 0..) |item_ref, item_i| {
+                _ = try sema.validateSwitchItemEnum(
+                    block,
+                    seen_enum_fields,
+                    &range_set,
+                    item_ref,
+                    cond_ty,
+                    block.src(.{ .switch_case_item = .{
+                        .switch_node_offset = src_node_offset,
+                        .case_idx = .special,
+                        .item_idx = .{ .kind = .single, .index = @intCast(item_i) },
+                    } }),
+                );
+            }
+            try sema.validateSwitchNoRange(block, @intCast(absorbed_ranges.len), cond_ty, src_node_offset);
 
             var extra_index: usize = special.end;
             {
@@ -12219,7 +12260,7 @@ fn zirSwitchBlock(sema: *Sema, block: *Block, inst: Zir.Inst.Index, operand_is_r
                         );
                     }
                 },
-                .under, .none => {
+                .under, .absorbing_under, .none => {
                     if (true_count + false_count < 2) {
                         return sema.fail(
                             block,
@@ -12419,7 +12460,7 @@ fn zirSwitchBlock(sema: *Sema, block: *Block, inst: Zir.Inst.Index, operand_is_r
                     special.capture,
                     block.src(.{ .switch_capture = .{
                         .switch_node_offset = src_node_offset,
-                        .case_idx = LazySrcLoc.Offset.SwitchCaseIndex.special,
+                        .case_idx = .special,
                     } }),
                     undefined, // case_vals may be undefined for special prongs
                     .none,
@@ -12871,7 +12912,7 @@ fn analyzeSwitchRuntimeBlock(
                             special.capture,
                             child_block.src(.{ .switch_capture = .{
                                 .switch_node_offset = switch_node_offset,
-                                .case_idx = LazySrcLoc.Offset.SwitchCaseIndex.special,
+                                .case_idx = .special,
                             } }),
                             &.{item_ref},
                             item_ref,
@@ -12926,7 +12967,7 @@ fn analyzeSwitchRuntimeBlock(
                         special.capture,
                         child_block.src(.{ .switch_capture = .{
                             .switch_node_offset = switch_node_offset,
-                            .case_idx = LazySrcLoc.Offset.SwitchCaseIndex.special,
+                            .case_idx = .special,
                         } }),
                         &.{item_ref},
                         item_ref,
@@ -12966,7 +13007,7 @@ fn analyzeSwitchRuntimeBlock(
                         special.capture,
                         child_block.src(.{ .switch_capture = .{
                             .switch_node_offset = switch_node_offset,
-                            .case_idx = LazySrcLoc.Offset.SwitchCaseIndex.special,
+                            .case_idx = .special,
                         } }),
                         &.{item_ref},
                         item_ref,
@@ -13003,7 +13044,7 @@ fn analyzeSwitchRuntimeBlock(
                         special.capture,
                         child_block.src(.{ .switch_capture = .{
                             .switch_node_offset = switch_node_offset,
-                            .case_idx = LazySrcLoc.Offset.SwitchCaseIndex.special,
+                            .case_idx = .special,
                         } }),
                         &.{.bool_true},
                         .bool_true,
@@ -13038,7 +13079,7 @@ fn analyzeSwitchRuntimeBlock(
                         special.capture,
                         child_block.src(.{ .switch_capture = .{
                             .switch_node_offset = switch_node_offset,
-                            .case_idx = LazySrcLoc.Offset.SwitchCaseIndex.special,
+                            .case_idx = .special,
                         } }),
                         &.{.bool_false},
                         .bool_false,
@@ -13098,7 +13139,7 @@ fn analyzeSwitchRuntimeBlock(
                 special.capture,
                 child_block.src(.{ .switch_capture = .{
                     .switch_node_offset = switch_node_offset,
-                    .case_idx = LazySrcLoc.Offset.SwitchCaseIndex.special,
+                    .case_idx = .special,
                 } }),
                 undefined, // case_vals may be undefined for special prongs
                 .none,
@@ -13361,7 +13402,7 @@ fn resolveSwitchComptime(
         special.capture,
         child_block.src(.{ .switch_capture = .{
             .switch_node_offset = switch_node_offset,
-            .case_idx = LazySrcLoc.Offset.SwitchCaseIndex.special,
+            .case_idx = .special,
         } }),
         undefined, // case_vals may be undefined for special prongs
         if (special.is_inline) cond_operand else .none,
