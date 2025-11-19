@@ -94,7 +94,7 @@ pub fn extraData(code: Zir, comptime T: type, index: usize) ExtraData(T) {
 
             Inst.Call.Flags,
             Inst.BuiltinCall.Flags,
-            Inst.SwitchBlock.Bits,
+            Inst.Switch.Bits,
             Inst.SwitchBlockErrUnion.Bits,
             Inst.FuncFancy.Bits,
             Inst.Declaration.Flags,
@@ -346,7 +346,7 @@ pub const Inst = struct {
         /// Uses the `break` union field.
         break_inline,
         /// Branch from within a switch case to the case specified by the operand.
-        /// Uses the `break` union field. `block_inst` refers to a `switch_block` or `switch_block_ref`.
+        /// Uses the `break` union field. `block_inst` refers to a `switch` or `switch_ref`.
         switch_continue,
         /// Checks that comptime control flow does not happen inside a runtime block.
         /// Uses the `un_node` union field.
@@ -714,10 +714,10 @@ pub const Inst = struct {
         decl_literal_no_coerce,
         /// A switch expression. Uses the `pl_node` union field.
         /// AST node is the switch, payload is `SwitchBlock`.
-        switch_block,
+        @"switch",
         /// A switch expression. Uses the `pl_node` union field.
         /// AST node is the switch, payload is `SwitchBlock`. Operand is a pointer.
-        switch_block_ref,
+        switch_ref,
         /// A switch on an error union `a catch |err| switch (err) {...}`.
         /// Uses the `pl_node` union field. AST node is the `catch`, payload is `SwitchBlockErrUnion`.
         switch_block_err_union,
@@ -1220,8 +1220,8 @@ pub const Inst = struct {
                 .typeof_log2_int_type,
                 .resolve_inferred_alloc,
                 .set_eval_branch_quota,
-                .switch_block,
-                .switch_block_ref,
+                .@"switch",
+                .switch_ref,
                 .switch_block_err_union,
                 .validate_deref,
                 .validate_destructure,
@@ -1506,8 +1506,8 @@ pub const Inst = struct {
                 .slice_sentinel_ty,
                 .import,
                 .typeof_log2_int_type,
-                .switch_block,
-                .switch_block_ref,
+                .@"switch",
+                .switch_ref,
                 .switch_block_err_union,
                 .union_init,
                 .field_type_ref,
@@ -1758,8 +1758,8 @@ pub const Inst = struct {
                 .enum_literal = .str_tok,
                 .decl_literal = .pl_node,
                 .decl_literal_no_coerce = .pl_node,
-                .switch_block = .pl_node,
-                .switch_block_ref = .pl_node,
+                .@"switch" = .pl_node,
+                .switch_ref = .pl_node,
                 .switch_block_err_union = .pl_node,
                 .validate_deref = .un_node,
                 .validate_destructure = .pl_node,
@@ -3244,53 +3244,58 @@ pub const Inst = struct {
         };
     };
 
+    /// Trailing:
     /// 0. multi_cases_len: u32 // If has_multi_cases is set.
-    /// 1. tag_capture_inst: u32 // If any_has_tag_capture is set. Index of instruction prongs use to refer to the inline tag capture.
-    /// 2. else_body { // If special_prong.hasElse() is set.
-    ///        info: ProngInfo,
-    ///        body member Index for every info.body_len
-    ///     }
-    /// 3. under_body { // If special_prong.hasUnder() is set.
-    ///        item: Ref, // If special_prong.hasOneAdditionalItem() is set.
-    ///        items_len: u32, // If special_prong.hasManyAdditionalItems() is set.
-    ///        ranges_len: u32, // If special_prong.hasManyAdditionalItems() is set.
-    ///        info: ProngInfo,
-    ///        item: Ref, // for every items_len
-    ///        ranges: { // for every ranges_len
-    ///            item_first: Ref,
-    ///            item_last: Ref,
+    /// 1. tag_capture_inst: Inst.Index // If any_has_tag_capture is set.
+    ///                                 // Index of instruction prongs use to
+    ///                                 // refer to the inline tag capture.
+    /// 2. else_prong_info: ProngInfo, // If has_else is set.
+    /// 3. under_prong_info: ProngInfo, // If has_under is set and
+    ///                                 // under_has_additional_items is *not* set.
+    /// 4. under_index: u32, // If under_has_additional_items is set. Index into cases
+    /// 5. scalar_prong_info: ProngInfo, // for every scalar_cases_len
+    /// 6. multi_prong_info: ProngInfo, // for every multi_cases_len
+    /// 7. multi_case_items_len: u32, // for every multi_cases_len
+    /// 8. multi_case_ranges_len: u32, // If has_ranges is set: for every multi_cases_len
+    /// 9. scalar_item_body_len: u32, // for every scalar_cases_len
+    /// 10. multi_bodies_len: { // for every multi_cases_len
+    ///        item_body_len: u32, // for each multi_case_items_len
+    ///        range_bodies_len: { // for each multi_case_ranges_len
+    ///            first_len: u32,
+    ///            last_len: u32,
     ///        }
-    ///        body member Index for every info.body_len
-    ///     }
-    /// 4. scalar_cases: { // for every scalar_cases_len
-    ///        item: Ref,
-    ///        info: ProngInfo,
-    ///        body member Index for every info.body_len
-    ///     }
-    /// 5. multi_cases: { // for every multi_cases_len
-    ///        items_len: u32,
-    ///        ranges_len: u32,
-    ///        info: ProngInfo,
-    ///        item: Ref, // for every items_len
-    ///        ranges: { // for every ranges_len
-    ///            item_first: Ref,
-    ///            item_last: Ref,
-    ///        }
-    ///        body member Index for every info.body_len
     ///    }
-    ///
-    /// When analyzing a case body, the switch instruction itself refers to the
-    /// captured payload. Whether this is captured by reference or by value
-    /// depends on whether the `byref` bit is set for the corresponding body.
-    pub const SwitchBlock = struct {
-        /// The operand passed to the `switch` expression. If this is a
-        /// `switch_block`, this is the operand value; if `switch_block_ref` it
-        /// is a pointer to the operand. `switch_block_ref` is always used if
-        /// any prong has a byref capture.
+    /// 11. else_body: { // If has_else is set.
+    ///        body_inst: Inst.Index, // for every else_prong_info.body_len
+    ///    }
+    /// 12. under_body: { // If has_under is set and
+    ///                   // under_has_additional_items is *not* set.
+    ///        body_inst: Inst.Index, // for every under_prong_info.body_len
+    ///    }
+    /// 13. scalar_bodies: { // for every scalar_cases_len
+    ///        item_body: { // for each body_len in scalar_item_body_len
+    ///            body_inst: Inst.Index, // for every body_len
+    ///        }
+    ///        prong_body: { // for each body_len in scalar_prong_info
+    ///            body_inst: Inst.Index, // for every body_len
+    ///        }
+    ///    }
+    /// 14. multi_bodies: { // for each multi_bodies_len
+    ///        item_body: { // for each body_len in item_body_len
+    ///            body_inst: Inst.Index, // for every body_len
+    ///        }
+    ///        range_bodies: { // for each bodies_len in range_bodies_len
+    ///            first_body_inst: Inst.Index, // for every bodies_len.first_len
+    ///            last_body_inst: Inst.Index, // for every bodies_len.last_len
+    ///        }
+    ///        prong_body: {
+    ///            body_inst: Inst.Index, // for each multi_prong_info.body_len
+    ///        }
+    ///    }
+    pub const Switch = struct {
         operand: Ref,
         bits: Bits,
 
-        /// These are stored in trailing data in `extra` for each prong.
         pub const ProngInfo = packed struct(u32) {
             body_len: u28,
             capture: ProngInfo.Capture,
@@ -3307,8 +3312,13 @@ pub const Inst = struct {
         pub const Bits = packed struct(u32) {
             /// If true, one or more prongs have multiple items.
             has_multi_cases: bool,
-            /// Information about the special prong.
-            special_prongs: SpecialProngs,
+            /// If true, one or more prongs have ranges.
+            /// Only valid if `has_multi_cases` is also set.
+            any_ranges: bool,
+            has_else: bool,
+            has_under: bool,
+            /// Only valid if `has_under` is also set.
+            under_has_additional_items: bool,
             /// If true, at least one prong has an inline tag capture.
             any_has_tag_capture: bool,
             /// If true, at least one prong has a capture which may not
@@ -3318,12 +3328,7 @@ pub const Inst = struct {
             has_continue: bool,
             scalar_cases_len: ScalarCasesLen,
 
-            pub const ScalarCasesLen = u25;
-        };
-
-        pub const MultiProng = struct {
-            items: []const Ref,
-            body: []const Index,
+            pub const ScalarCasesLen = u24;
         };
     };
 
@@ -3892,69 +3897,6 @@ pub const Inst = struct {
         /// The import path.
         path: NullTerminatedString,
     };
-};
-
-pub const SpecialProngs = enum(u3) {
-    none = 0b000,
-    /// Simple `else` prong.
-    /// `else => {},`
-    @"else" = 0b001,
-    /// Simple `_` prong.
-    /// `_ => {},`
-    under = 0b010,
-    /// Both an `else` and a `_` prong.
-    /// `else => {},`
-    /// `_ => {},`
-    under_and_else = 0b011,
-    /// `_` prong with 1 additional item.
-    /// `a, _ => {},`
-    under_one_item = 0b100,
-    /// Both an `else` and a `_` prong with 1 additional item.
-    /// `else => {},`
-    /// `a, _ => {},`
-    under_one_item_and_else = 0b101,
-    /// `_` prong with >1 additional items.
-    /// `a, _, b => {},`
-    under_many_items = 0b110,
-    /// Both an `else` and a `_` prong with >1 additional items.
-    /// `else => {},`
-    /// `a, _, b => {},`
-    under_many_items_and_else = 0b111,
-
-    pub const AdditionalItems = enum(u3) {
-        none = @intFromEnum(SpecialProngs.under),
-        one = @intFromEnum(SpecialProngs.under_one_item),
-        many = @intFromEnum(SpecialProngs.under_many_items),
-    };
-
-    pub fn init(has_else: bool, has_under: bool, additional_items: AdditionalItems) SpecialProngs {
-        const else_bit: u3 = @intFromBool(has_else);
-        const under_bits: u3 = if (has_under)
-            @intFromEnum(additional_items)
-        else
-            @intFromEnum(SpecialProngs.none);
-        return @enumFromInt(else_bit | under_bits);
-    }
-
-    pub fn hasElse(special_prongs: SpecialProngs) bool {
-        return (@intFromEnum(special_prongs) & 0b001) != 0;
-    }
-
-    pub fn hasUnder(special_prongs: SpecialProngs) bool {
-        return (@intFromEnum(special_prongs) & 0b110) != 0;
-    }
-
-    pub fn hasAdditionalItems(special_prongs: SpecialProngs) bool {
-        return (@intFromEnum(special_prongs) & 0b100) != 0;
-    }
-
-    pub fn hasOneAdditionalItem(special_prongs: SpecialProngs) bool {
-        return (@intFromEnum(special_prongs) & 0b110) == @intFromEnum(SpecialProngs.under_one_item);
-    }
-
-    pub fn hasManyAdditionalItems(special_prongs: SpecialProngs) bool {
-        return (@intFromEnum(special_prongs) & 0b110) == @intFromEnum(SpecialProngs.under_many_items);
-    }
 };
 
 pub const DeclIterator = struct {
@@ -4721,7 +4663,7 @@ fn findTrackableInner(
             const body = zir.bodySlice(extra.end, extra.data.body_len);
             try zir.findTrackableBody(gpa, contents, defers, body);
         },
-        .switch_block, .switch_block_ref => return zir.findTrackableSwitch(gpa, contents, defers, inst, .normal),
+        .@"switch", .switch_ref => return zir.findTrackableSwitch(gpa, contents, defers, inst, .normal),
         .switch_block_err_union => return zir.findTrackableSwitch(gpa, contents, defers, inst, .err_union),
 
         .suspend_block => @panic("TODO iterate suspend block"),
@@ -4769,15 +4711,17 @@ fn findTrackableInner(
     }
 }
 
+/// TODO!!!
 fn findTrackableSwitch(
     zir: Zir,
     gpa: Allocator,
     contents: *DeclContents,
     defers: *std.AutoHashMapUnmanaged(u32, void),
     inst: Inst.Index,
-    /// Distinguishes between `switch_block[_ref]` and `switch_block_err_union`.
+    /// Distinguishes between `switch[_ref]` and `switch_block_err_union`.
     comptime kind: enum { normal, err_union },
 ) Allocator.Error!void {
+    if (true) @panic("TODO");
     const inst_data = zir.instructions.items(.data)[@intFromEnum(inst)].pl_node;
     const extra = zir.extraData(switch (kind) {
         .normal => Inst.SwitchBlock,
@@ -4803,7 +4747,7 @@ fn findTrackableSwitch(
         .normal => extra.data.bits.special_prongs != .none,
         .err_union => has_special: {
             // Handle `non_err_body` first.
-            const prong_info: Inst.SwitchBlock.ProngInfo = @bitCast(zir.extra[extra_index]);
+            const prong_info: Inst.Switch.ProngInfo = @bitCast(zir.extra[extra_index]);
             extra_index += 1;
             const body = zir.bodySlice(extra_index, prong_info.body_len);
             extra_index += body.len;
@@ -4820,7 +4764,7 @@ fn findTrackableSwitch(
         else
             true;
         if (has_else) {
-            const prong_info: Inst.SwitchBlock.ProngInfo = @bitCast(zir.extra[extra_index]);
+            const prong_info: Inst.Switch.ProngInfo = @bitCast(zir.extra[extra_index]);
             extra_index += 1;
             const body = zir.bodySlice(extra_index, prong_info.body_len);
             extra_index += body.len;
@@ -4841,7 +4785,7 @@ fn findTrackableSwitch(
                     extra_index += 1;
                     trailing_items_len = items_len + ranges_len * 2;
                 }
-                const prong_info: Inst.SwitchBlock.ProngInfo = @bitCast(zir.extra[extra_index]);
+                const prong_info: Inst.Switch.ProngInfo = @bitCast(zir.extra[extra_index]);
                 extra_index += 1 + trailing_items_len;
                 const body = zir.bodySlice(extra_index, prong_info.body_len);
                 extra_index += body.len;
@@ -4855,7 +4799,7 @@ fn findTrackableSwitch(
         const scalar_cases_len = extra.data.bits.scalar_cases_len;
         for (0..scalar_cases_len) |_| {
             extra_index += 1;
-            const prong_info: Inst.SwitchBlock.ProngInfo = @bitCast(zir.extra[extra_index]);
+            const prong_info: Inst.Switch.ProngInfo = @bitCast(zir.extra[extra_index]);
             extra_index += 1;
             const body = zir.bodySlice(extra_index, prong_info.body_len);
             extra_index += body.len;
@@ -4869,7 +4813,7 @@ fn findTrackableSwitch(
             extra_index += 1;
             const ranges_len = zir.extra[extra_index];
             extra_index += 1;
-            const prong_info: Inst.SwitchBlock.ProngInfo = @bitCast(zir.extra[extra_index]);
+            const prong_info: Inst.Switch.ProngInfo = @bitCast(zir.extra[extra_index]);
             extra_index += 1;
 
             extra_index += items_len + ranges_len * 2;
@@ -5215,6 +5159,227 @@ pub fn getAssociatedSrcHash(zir: Zir, inst: Zir.Inst.Index) ?std.zig.SrcHash {
         else => return null,
     }
 }
+
+pub fn getSwitch(zir: *const Zir, switch_inst: Inst.Index) UnwrappedSwitch {
+    const inst_data = zir.instructions.items(.data)[@intFromEnum(switch_inst)].pl_node;
+    const extra = zir.extraData(Inst.Switch, inst_data.payload_index);
+    const bits = extra.data.bits;
+    var extra_index = extra.end;
+    const multi_cases_len = if (bits.has_multi_cases) blk: {
+        const multi_cases_len = zir.extra[extra_index];
+        extra_index += 1;
+        break :blk multi_cases_len;
+    } else 0;
+    const tag_capture_inst: Inst.OptionalIndex = if (bits.any_has_tag_capture) blk: {
+        const tag_capture_inst: Inst.Index = @enumFromInt(zir.extra[extra_index]);
+        extra_index += 1;
+        break :blk tag_capture_inst.toOptional();
+    } else .none;
+    const else_prong_info: ?Inst.Switch.ProngInfo = if (bits.has_else) blk: {
+        const else_prong_info: Inst.Switch.ProngInfo = @bitCast(zir.extra[extra_index]);
+        extra_index += 1;
+        break :blk else_prong_info;
+    } else null;
+    const under_case: UnwrappedSwitch.Case.Under = if (bits.has_under) blk: {
+        if (bits.under_has_additional_items) {
+            const case_index = zir.extra[extra_index];
+            extra_index += 1;
+            break :blk .{ .case_index = case_index };
+        } else {
+            const prong_info: Inst.Switch.ProngInfo = @bitCast(zir.extra[extra_index]);
+            extra_index += 1;
+            break :blk .{ .prong_info = prong_info };
+        }
+    } else .none;
+    const prong_infos: []const Inst.Switch.ProngInfo =
+        @ptrCast(zir.extra[extra_index..][0 .. bits.scalar_cases_len + multi_cases_len]);
+    extra_index += prong_infos.len;
+    const multi_case_items_lens = zir.extra[extra_index..][0..multi_cases_len];
+    extra_index += multi_case_items_lens.len;
+    const multi_case_ranges_lens: ?[]const u32 = if (bits.any_ranges) blk: {
+        const multi_case_ranges_lens = zir.extra[extra_index..][0..multi_cases_len];
+        extra_index += multi_case_ranges_lens.len;
+        break :blk multi_case_ranges_lens;
+    } else null;
+    var total_items_len: usize = bits.scalar_cases_len;
+    for (multi_case_items_lens) |items_len| {
+        total_items_len += items_len;
+    }
+    if (multi_case_ranges_lens) |ranges_lens| for (ranges_lens) |ranges_len| {
+        total_items_len += 2 * ranges_len;
+    };
+    const body_lens = zir.extra[extra_index..][0..total_items_len];
+    extra_index += body_lens.len;
+    return .{
+        .operand = extra.data.operand,
+        .src_node_offset = inst_data.src_node,
+        .tag_capture_inst = tag_capture_inst,
+        .any_non_inline_capture = bits.any_non_inline_capture,
+        .has_continue = bits.has_continue,
+        .else_prong_info = else_prong_info,
+        .under_case = under_case,
+        .prong_infos = prong_infos,
+        .multi_case_items_lens = multi_case_items_lens,
+        .multi_case_ranges_lens = multi_case_ranges_lens,
+        .body_lens = body_lens,
+        .end = extra_index,
+    };
+}
+
+/// Trailing (for each `Case.Iterator.next()`, starting at `end`):
+/// 0. item_body: { // for each body_len in Case.item_body_lens
+///        body_inst: Inst.Index, // for every body_len
+///    }
+/// 1. range_bodies: { // for each .{first_len, last_len} in Case.range_bodies_len
+///        first_body_inst: Inst.Index, // for every first_len
+///        last_body_inst: Inst.Index, // for every last_len
+///    }
+/// 2. prong_body: {
+///        body_inst: Inst.Index, // for every Case.prong_info.body_len,
+///    }
+pub const UnwrappedSwitch = struct {
+    operand: Inst.Ref,
+    src_node_offset: Ast.Node.Offset,
+    tag_capture_inst: Inst.OptionalIndex,
+    /// If true, at least one prong has a capture which may not
+    /// be comptime-known via `inline`.
+    any_non_inline_capture: bool,
+    /// If true, at least one prong contains a `continue`.
+    has_continue: bool,
+    // Refer to doc comment and `iterateCases` to access everything below correctly.
+    else_prong_info: ?Inst.Switch.ProngInfo,
+    under_case: Case.Under,
+    prong_infos: []const Inst.Switch.ProngInfo,
+    multi_case_items_lens: []const u32,
+    multi_case_ranges_lens: ?[]const u32,
+    body_lens: []const u32,
+    end: usize,
+
+    pub const Case = struct {
+        index: Case.Index,
+        prong_info: Inst.Switch.ProngInfo,
+        item_body_lens: []const u32,
+        range_bodies_lens: []const [2]u32,
+
+        pub const Index = packed struct(u32) {
+            kind: enum(u1) { scalar, multi },
+            has_under: bool,
+            value: u30,
+
+            pub const @"else": Case.Index = .{
+                .kind = .scalar,
+                .has_under = false,
+                .value = std.math.maxInt(u30),
+            };
+            /// `_` with no additional items.
+            pub const bare_under: Case.Index = .{
+                .kind = .scalar,
+                .has_under = true,
+                .value = std.math.maxInt(u30),
+            };
+        };
+
+        pub const Under = union(enum) {
+            none,
+            prong_info: Inst.Switch.ProngInfo,
+            case_index: u32,
+
+            pub fn prongInfo(under: Under) ?Inst.Switch.ProngInfo {
+                return switch (under) {
+                    .none, .case_index => null,
+                    .prong_info => |prong_info| prong_info,
+                };
+            }
+            pub fn caseIndex(under: Under) ?u32 {
+                return switch (under) {
+                    .none, .prong_info => null,
+                    .case_index => |case_index| case_index,
+                };
+            }
+        };
+
+        pub fn isElse(case: *const Case) bool {
+            return case.index == Case.Index.@"else";
+        }
+
+        pub fn isUnder(case: *const Case) bool {
+            return case.index.has_under;
+        }
+
+        pub const Iterator = struct {
+            next_idx: u32,
+            else_prong_info: ?Inst.Switch.ProngInfo,
+            under_case: Case.Under,
+            prong_infos: []const Inst.Switch.ProngInfo,
+            multi_case_items_lens: []const u32,
+            multi_case_ranges_lens: ?[]const u32,
+            body_lens: []const u32,
+
+            pub fn next(it: *Iterator) ?Case {
+                if (it.else_prong_info) |prong_info| {
+                    it.else_prong_info = null;
+                    return .{
+                        .index = .@"else",
+                        .prong_info = prong_info,
+                        .item_body_lens = &.{},
+                        .range_bodies_lens = &.{},
+                    };
+                }
+                if (it.under_case.prongInfo()) |prong_info| {
+                    it.under_case = .none;
+                    return .{
+                        .index = .bare_under,
+                        .prong_info = prong_info,
+                        .item_body_lens = &.{},
+                        .range_bodies_lens = &.{},
+                    };
+                }
+                const idx = it.next_idx;
+                if (idx == it.prong_infos.len) return null;
+                it.next_idx += 1;
+                const scalar_case_count = it.prong_infos.len - it.multi_case_items_lens.len;
+                return if (idx < scalar_case_count) .{
+                    .index = .{
+                        .kind = .scalar,
+                        .has_under = idx == it.under_case.caseIndex(),
+                        .value = @intCast(idx),
+                    },
+                    .prong_info = it.prong_infos[idx],
+                    .item_body_lens = it.bodyLens(1),
+                    .range_bodies_lens = &.{},
+                } else .{
+                    .index = .{
+                        .kind = .multi,
+                        .has_under = idx == it.under_case.caseIndex(),
+                        .value = @intCast(idx - scalar_case_count),
+                    },
+                    .prong_info = it.prong_infos[idx],
+                    .item_body_lens = it.bodyLens(it.multi_case_items_lens[idx - scalar_case_count]),
+                    .range_bodies_lens = if (it.multi_case_ranges_lens) |ranges_lens| b: {
+                        break :b @ptrCast(it.bodyLens(2 * ranges_lens[idx - scalar_case_count]));
+                    } else &.{},
+                };
+            }
+            fn bodyLens(it: *Iterator, count: u32) []const u32 {
+                const lens = it.body_lens[0..count];
+                it.body_lens = it.body_lens[count..];
+                return lens;
+            }
+        };
+    };
+
+    pub fn iterateCases(unwrapped: UnwrappedSwitch) Case.Iterator {
+        return .{
+            .next_idx = 0,
+            .else_prong_info = unwrapped.else_prong_info,
+            .under_case = unwrapped.under_case,
+            .prong_infos = unwrapped.prong_infos,
+            .multi_case_items_lens = unwrapped.multi_case_items_lens,
+            .multi_case_ranges_lens = unwrapped.multi_case_ranges_lens,
+            .body_lens = unwrapped.body_lens,
+        };
+    }
+};
 
 /// When the ZIR update tracking logic must be modified to consider new instructions,
 /// change this constant to trigger compile errors at all relevant locations.

@@ -114,7 +114,7 @@ fn setExtra(astgen: *AstGen, index: usize, extra: anytype) void {
             i32,
             Zir.Inst.Call.Flags,
             Zir.Inst.BuiltinCall.Flags,
-            Zir.Inst.SwitchBlock.Bits,
+            Zir.Inst.Switch.Bits,
             Zir.Inst.SwitchBlockErrUnion.Bits,
             Zir.Inst.FuncFancy.Bits,
             Zir.Inst.Param.Type,
@@ -2286,10 +2286,10 @@ fn continueExpr(parent_gz: *GenZir, parent_scope: *Scope, node: Ast.Node.Index) 
                         if (try astgen.tokenIdentEql(label.token, break_label)) {
                             const maybe_switch_tag = astgen.instructions.items(.tag)[@intFromEnum(label.block_inst)];
                             if (opt_rhs != .none) switch (maybe_switch_tag) {
-                                .switch_block, .switch_block_ref => {},
+                                .@"switch", .switch_ref => {},
                                 else => return astgen.failNode(node, "cannot continue loop with operand", .{}),
                             } else switch (maybe_switch_tag) {
-                                .switch_block, .switch_block_ref => return astgen.failNode(node, "cannot continue switch without operand", .{}),
+                                .@"switch", .switch_ref => return astgen.failNode(node, "cannot continue switch without operand", .{}),
                                 else => {},
                             }
 
@@ -2305,7 +2305,7 @@ fn continueExpr(parent_gz: *GenZir, parent_scope: *Scope, node: Ast.Node.Index) 
                     // This `continue` is unlabeled. If the gz we've found corresponds to a labeled
                     // `switch`, ignore it and continue to parent scopes.
                     switch (astgen.instructions.items(.tag)[@intFromEnum(label.block_inst)]) {
-                        .switch_block, .switch_block_ref => {
+                        .@"switch", .switch_ref => {
                             scope = gen_zir.parent;
                             continue;
                         },
@@ -2796,8 +2796,8 @@ fn addEnsureResult(gz: *GenZir, maybe_unused_result: Zir.Inst.Ref, statement: As
             .slice_length,
             .slice_sentinel_ty,
             .import,
-            .switch_block,
-            .switch_block_ref,
+            .@"switch",
+            .switch_ref,
             .switch_block_err_union,
             .union_init,
             .field_type_ref,
@@ -7381,7 +7381,7 @@ fn switchExprErrUnion(
         const case_slice = case_scope.instructionsSlice();
         const body_len = astgen.countBodyLenAfterFixupsExtraRefs(case_slice, &.{switch_block});
         try payloads.ensureUnusedCapacity(gpa, body_len);
-        const capture: Zir.Inst.SwitchBlock.ProngInfo.Capture = switch (node_ty) {
+        const capture: Zir.Inst.Switch.ProngInfo.Capture = switch (node_ty) {
             .@"catch" => .none,
             .@"if" => if (if_full.payload_token == null)
                 .none
@@ -7390,7 +7390,7 @@ fn switchExprErrUnion(
             else
                 .by_val,
         };
-        payloads.items[body_len_index] = @bitCast(Zir.Inst.SwitchBlock.ProngInfo{
+        payloads.items[body_len_index] = @bitCast(Zir.Inst.Switch.ProngInfo{
             .body_len = @intCast(body_len),
             .capture = capture,
             .is_inline = false,
@@ -7564,7 +7564,7 @@ fn switchExprErrUnion(
             const extra_insts: []const Zir.Inst.Index = if (uses_err) &.{ switch_block, err_inst } else &.{switch_block};
             const body_len = astgen.countBodyLenAfterFixupsExtraRefs(case_slice, extra_insts);
             try payloads.ensureUnusedCapacity(gpa, body_len);
-            payloads.items[body_len_index] = @bitCast(Zir.Inst.SwitchBlock.ProngInfo{
+            payloads.items[body_len_index] = @bitCast(Zir.Inst.Switch.ProngInfo{
                 .body_len = @intCast(body_len),
                 .capture = if (case.payload_token != null) .by_val else .none,
                 .is_inline = case.inline_token != null,
@@ -7619,7 +7619,7 @@ fn switchExprErrUnion(
             const ranges_len = payloads.items[start_index + 1];
             end_index += 3 + items_len + 2 * ranges_len;
         }
-        const prong_info: Zir.Inst.SwitchBlock.ProngInfo = @bitCast(payloads.items[body_len_index]);
+        const prong_info: Zir.Inst.Switch.ProngInfo = @bitCast(payloads.items[body_len_index]);
         end_index += prong_info.body_len;
         astgen.extra.appendSliceAssumeCapacity(payloads.items[start_index..end_index]);
     }
@@ -7663,20 +7663,21 @@ fn switchExpr(
     }
 
     // We perform two passes over the AST. This first pass is to collect information
-    // for the following variables, make note of the special prong AST node index,
-    // and bail out with a compile error if there are multiple special prongs present.
+    // for the following variables, make note of the special prong AST node indices,
+    // and bail out with a compile error if there are incompatible special prongs present.
     var any_payload_is_ref = false;
     var any_has_tag_capture = false;
     var any_non_inline_capture = false;
     var scalar_cases_len: u32 = 0;
     var multi_cases_len: u32 = 0;
-    var inline_cases_len: u32 = 0;
+    var total_items_len: usize = 0;
+    var total_ranges_len: usize = 0;
     var else_case_node: Ast.Node.OptionalIndex = .none;
     var else_src: ?Ast.TokenIndex = null;
-    var underscore_case_node: Ast.Node.OptionalIndex = .none;
+    var under_case_node: Ast.Node.OptionalIndex = .none;
     var underscore_node: Ast.Node.OptionalIndex = .none;
     var underscore_src: ?Ast.TokenIndex = null;
-    var underscore_additional_items: Zir.SpecialProngs.AdditionalItems = .none;
+    var under_is_bare = false;
     for (case_nodes) |case_node| {
         const case = tree.fullSwitchCase(case_node).?;
         if (case.payload_token) |payload_token| {
@@ -7706,13 +7707,7 @@ fn switchExpr(
                     case_src,
                     "multiple else prongs in switch expression",
                     .{},
-                    &[_]u32{
-                        try astgen.errNoteTok(
-                            src,
-                            "previous else prong here",
-                            .{},
-                        ),
-                    },
+                    &.{try astgen.errNoteTok(src, "previous else prong here", .{})},
                 );
             }
             else_case_node = case_node.toOptional();
@@ -7720,63 +7715,56 @@ fn switchExpr(
             continue;
         }
 
-        // Check for '_' prong.
+        // Check for '_' prong and ranges.
         var case_has_underscore = false;
+        var case_has_ranges = false;
         for (case.ast.values) |val| {
             switch (tree.nodeTag(val)) {
-                .identifier => if (mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(val)), "_")) {
-                    const val_src = tree.nodeMainToken(val);
-                    if (underscore_src) |src| {
-                        return astgen.failTokNotes(
-                            val_src,
-                            "multiple '_' prongs in switch expression",
-                            .{},
-                            &[_]u32{
-                                try astgen.errNoteTok(
-                                    src,
-                                    "previous '_' prong here",
-                                    .{},
-                                ),
-                            },
-                        );
-                    }
-                    if (case.inline_token != null) {
-                        return astgen.failTok(val_src, "cannot inline '_' prong", .{});
-                    }
-                    underscore_case_node = case_node.toOptional();
-                    underscore_src = val_src;
-                    underscore_node = val.toOptional();
-                    underscore_additional_items = switch (case.ast.values.len) {
-                        0 => unreachable,
-                        1 => .none,
-                        2 => .one,
-                        else => .many,
-                    };
-                    case_has_underscore = true;
+                .switch_range => {
+                    total_ranges_len += 1;
+                    case_has_ranges = true;
                 },
                 .string_literal => return astgen.failNode(val, "cannot switch on strings", .{}),
-                else => {},
+                else => |tag| {
+                    if (tag == .identifier and
+                        mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(val)), "_"))
+                    {
+                        const val_src = tree.nodeMainToken(val);
+                        if (underscore_src) |src| {
+                            return astgen.failTokNotes(
+                                val_src,
+                                "multiple '_' prongs in switch expression",
+                                .{},
+                                &.{try astgen.errNoteTok(src, "previous '_' prong here", .{})},
+                            );
+                        }
+                        if (case.inline_token != null) {
+                            return astgen.failTok(val_src, "cannot inline '_' prong", .{});
+                        }
+                        under_case_node = case_node.toOptional();
+                        underscore_src = val_src;
+                        underscore_node = val.toOptional();
+                        under_is_bare = case.ast.values.len == 1;
+                        case_has_underscore = true;
+                    } else {
+                        total_items_len += 1;
+                    }
+                },
             }
         }
-        if (case_has_underscore) continue;
 
-        if (case.ast.values.len == 1 and tree.nodeTag(case.ast.values[0]) != .switch_range) {
+        const case_len = case.ast.values.len - @intFromBool(case_has_underscore);
+        if (case_len == 1 and !case_has_ranges) {
             scalar_cases_len += 1;
-        } else {
+        } else if (case_len >= 1) {
             multi_cases_len += 1;
-        }
-        if (case.inline_token != null) {
-            inline_cases_len += 1;
         }
     }
 
-    const special_prongs: Zir.SpecialProngs = .init(
-        else_src != null,
-        underscore_src != null,
-        underscore_additional_items,
-    );
-    const has_else = special_prongs.hasElse();
-    const has_under = special_prongs.hasUnder();
+    const has_else = else_src != null;
+    const has_under = underscore_src != null;
+    if (under_is_bare) assert(has_under);
+    const any_ranges = total_ranges_len > 0;
 
     const operand_ri: ResultInfo = .{ .rl = if (any_payload_is_ref) .ref else .none };
 
@@ -7784,7 +7772,6 @@ fn switchExpr(
     const operand_lc: LineColumn = .{ astgen.source_line - parent_gz.decl_line, astgen.source_column };
 
     const raw_operand = try expr(parent_gz, scope, operand_ri, operand_node);
-    const item_ri: ResultInfo = .{ .rl = .none };
 
     // If this switch is labeled, it may have `continue`s targeting it, and thus we need the operand type
     // to provide a result type.
@@ -7792,19 +7779,67 @@ fn switchExpr(
         break :t try parent_gz.addUnNode(.typeof, raw_operand, operand_node);
     } else undefined;
 
-    // This contains the data that goes into the `extra` array for the SwitchBlock/SwitchBlockMulti,
-    // except the first cases_nodes.len slots are a table that indexes payloads later in the array, with
-    // the special case index coming first, then scalar_case_len indexes, then multi_cases_len indexes
+    // If any prong has an inline tag capture, allocate a shared dummy instruction for it
+    const tag_inst = if (any_has_tag_capture) tag_inst: {
+        const inst: Zir.Inst.Index = @enumFromInt(astgen.instructions.len);
+        try astgen.instructions.append(astgen.gpa, .{
+            .tag = .extended,
+            .data = .{ .extended = .{
+                .opcode = .value_placeholder,
+                .small = undefined,
+                .operand = undefined,
+            } },
+        });
+        break :tag_inst inst;
+    } else undefined;
+
+    // This contains all of the body lengths (already in the correct order) and
+    // the bodies they belong to that go into the `extra` array later, except the
+    // first item_table_end slots are a table that indexes the item bodies (and
+    // also indirectly the prong bodies, as they are always trailing after their
+    // item bodies).
     const payloads = &astgen.scratch;
     const scratch_top = astgen.scratch.items.len;
-    const case_table_start = scratch_top;
-    const else_case_index = if (has_else) case_table_start else undefined;
-    const under_case_index = if (has_under) case_table_start + @intFromBool(has_else) else undefined;
-    const scalar_case_table = case_table_start + @intFromBool(has_else) + @intFromBool(has_under);
-    const multi_case_table = scalar_case_table + scalar_cases_len;
-    const case_table_end = multi_case_table + multi_cases_len;
-    try astgen.scratch.resize(gpa, case_table_end);
+    var payloads_end = scratch_top;
+
+    // Since range item body pairs are always consecutive we don't technically
+    // have to keep track of the position of the second body. However handling
+    // all of the several indices and offsets is complicated enough as it is,
+    // so for the sake of keeping this function a little bit more simple we do
+    // it anyway.
+
+    const scalar_body_table = payloads_end;
+    payloads_end += scalar_cases_len;
+    const multi_item_body_table = payloads_end;
+    payloads_end += total_items_len + 2 * total_ranges_len - scalar_cases_len;
+    const multi_prong_body_table = payloads_end;
+    payloads_end += multi_cases_len;
+    const body_table_end = payloads_end;
+
+    const scalar_prong_infos_start = payloads_end;
+    payloads_end += scalar_cases_len;
+    const multi_prong_infos_start = payloads_end;
+    payloads_end += multi_cases_len;
+    const multi_case_items_lens_start = payloads_end;
+    payloads_end += multi_cases_len;
+    const multi_case_ranges_lens_start = if (any_ranges) blk: {
+        const multi_case_ranges_lens_start = payloads_end;
+        payloads_end += multi_cases_len;
+        break :blk multi_case_ranges_lens_start;
+    } else undefined;
+    const scalar_item_body_lens_start = payloads_end;
+    payloads_end += scalar_cases_len;
+    const multi_bodies_lens_start = payloads_end;
+    payloads_end += total_items_len - scalar_cases_len + 2 * total_ranges_len;
+    const bodies_start = payloads_end;
+
+    try payloads.resize(gpa, bodies_start);
     defer astgen.scratch.items.len = scratch_top;
+
+    var else_prong_body_start: u32 = undefined;
+    var bare_under_prong_body_start: u32 = undefined;
+    var else_extra: u32 = undefined;
+    var under_extra: u32 = undefined;
 
     var block_scope = parent_gz.makeSubBlock(scope);
     // block_scope not used for collecting instructions
@@ -7814,8 +7849,11 @@ fn switchExpr(
     // Sema expects a dbg_stmt immediately before switch_block(_ref)
     try emitDbgStmtForceCurrentIndex(parent_gz, operand_lc);
     // This gets added to the parent block later, after the item expressions.
-    const switch_tag: Zir.Inst.Tag = if (any_payload_is_ref) .switch_block_ref else .switch_block;
+    const switch_tag: Zir.Inst.Tag = if (any_payload_is_ref) .switch_ref else .@"switch";
     const switch_block = try parent_gz.makeBlockInst(switch_tag, node);
+    // Prong items use the switch instruction as their result type, so Sema has to
+    // temporarily store that type at the switch inst while resolving their values.
+    const item_ri: ResultInfo = .{ .rl = .{ .coerced_ty = switch_block.toRef() } };
 
     if (switch_full.label_token) |label_token| {
         block_scope.continue_block = switch_block.toOptional();
@@ -7834,32 +7872,84 @@ fn switchExpr(
         // `break_result_info` already set by `setBreakResultInfo`
     }
 
-    // We re-use this same scope for all cases, including the special prong, if any.
-    var case_scope = parent_gz.makeSubBlock(&block_scope.base);
-    case_scope.instructions_top = GenZir.unstacked_top;
-
-    // If any prong has an inline tag capture, allocate a shared dummy instruction for it
-    const tag_inst = if (any_has_tag_capture) tag_inst: {
-        const inst: Zir.Inst.Index = @enumFromInt(astgen.instructions.len);
-        try astgen.instructions.append(astgen.gpa, .{
-            .tag = .extended,
-            .data = .{ .extended = .{
-                .opcode = .value_placeholder,
-                .small = undefined,
-                .operand = undefined,
-            } },
-        });
-        break :tag_inst inst;
-    } else undefined;
+    // We re-use this same scope for all case items and contents.
+    var scratch_scope = parent_gz.makeSubBlock(&block_scope.base);
+    scratch_scope.instructions_top = GenZir.unstacked_top;
 
     // In this pass we generate all the item and prong expressions.
     var multi_case_index: u32 = 0;
     var scalar_case_index: u32 = 0;
+    var multi_item_offset: usize = 0;
     for (case_nodes) |case_node| {
         const case = tree.fullSwitchCase(case_node).?;
 
-        const is_multi_case = case.ast.values.len > 1 or
-            (case.ast.values.len == 1 and tree.nodeTag(case.ast.values[0]) == .switch_range);
+        const case_has_under = case_node.toOptional() == under_case_node;
+        const ranges_len: u32 = if (any_ranges) blk: {
+            var ranges_len: u32 = 0;
+            for (case.ast.values) |value| {
+                ranges_len += @intFromBool(tree.nodeTag(value) == .switch_range);
+            }
+            break :blk ranges_len;
+        } else 0;
+        const items_len: u32 = @intCast(case.ast.values.len - ranges_len - @intFromBool(case_has_under));
+        const is_multi_case = items_len > 1 or ranges_len > 0;
+
+        // item/range bodies in order of occurence
+        var item_i: usize = 0;
+        var range_i: usize = 0;
+        for (case.ast.values) |value| {
+            if (value.toOptional() == underscore_node) continue;
+            if (tree.nodeTag(value) == .switch_range) {
+                inline for (tree.nodeData(value).node_and_node) |range_item| {
+                    scratch_scope.instructions_top = parent_gz.instructions.items.len;
+                    defer scratch_scope.unstack();
+                    const range_node_result = try fullBodyExpr(&scratch_scope, scope, item_ri, range_item, .normal);
+                    if (!scratch_scope.endsWithNoReturn()) {
+                        _ = try scratch_scope.addBreakWithSrcNode(.break_inline, switch_block, range_node_result, range_item);
+                    }
+                    const item_slice = scratch_scope.instructionsSlice();
+                    const body_len = astgen.countBodyLenAfterFixupsExtraRefs(item_slice, &.{switch_block});
+                    const body_start: u32 = @intCast(payloads.items.len);
+                    try payloads.ensureUnusedCapacity(gpa, body_len);
+                    astgen.appendBodyWithFixupsExtraRefsArrayList(payloads, item_slice, &.{switch_block});
+                    const offset = multi_item_offset + items_len + range_i;
+                    payloads.items[multi_item_body_table + offset] = body_start;
+                    payloads.items[multi_bodies_lens_start + offset] = body_len;
+                    range_i += 1;
+                }
+            } else { // item
+                scratch_scope.instructions_top = parent_gz.instructions.items.len;
+                defer scratch_scope.unstack();
+                const item_result = try fullBodyExpr(&scratch_scope, scope, item_ri, value, .normal);
+                if (!scratch_scope.endsWithNoReturn()) {
+                    _ = try scratch_scope.addBreakWithSrcNode(.break_inline, switch_block, item_result, value);
+                }
+                const item_slice = scratch_scope.instructionsSlice();
+                const body_len = astgen.countBodyLenAfterFixupsExtraRefs(item_slice, &.{switch_block});
+                const body_start: u32 = @intCast(payloads.items.len);
+                try payloads.ensureUnusedCapacity(gpa, body_len);
+                astgen.appendBodyWithFixupsExtraRefsArrayList(payloads, item_slice, &.{switch_block});
+                if (is_multi_case) {
+                    const offset = multi_item_offset + item_i;
+                    payloads.items[multi_item_body_table + offset] = body_start;
+                    payloads.items[multi_bodies_lens_start + offset] = body_len;
+                } else {
+                    payloads.items[scalar_body_table + scalar_case_index] = body_start;
+                    payloads.items[scalar_item_body_lens_start + scalar_case_index] = body_len;
+                }
+                item_i += 1;
+            }
+        }
+        assert(item_i == items_len and range_i == 2 * ranges_len);
+        if (is_multi_case) {
+            payloads.items[multi_case_items_lens_start + multi_case_index] = items_len;
+            if (any_ranges) {
+                payloads.items[multi_case_ranges_lens_start + multi_case_index] = ranges_len;
+            }
+            multi_item_offset += items_len + 2 * ranges_len;
+        }
+
+        // capture and prong body
 
         var dbg_var_name: Zir.NullTerminatedString = .empty;
         var dbg_var_inst: Zir.Inst.Ref = undefined;
@@ -7869,10 +7959,10 @@ fn switchExpr(
         var capture_val_scope: Scope.LocalVal = undefined;
         var tag_scope: Scope.LocalVal = undefined;
 
-        var capture: Zir.Inst.SwitchBlock.ProngInfo.Capture = .none;
+        var capture: Zir.Inst.Switch.ProngInfo.Capture = .none;
 
-        const sub_scope = blk: {
-            const payload_token = case.payload_token orelse break :blk &case_scope.base;
+        const prong_body_scope: *Scope = scope: {
+            const payload_token = case.payload_token orelse break :scope &scratch_scope.base;
             const capture_is_ref = tree.tokenTag(payload_token) == .asterisk;
             const ident = payload_token + @intFromBool(capture_is_ref);
 
@@ -7886,13 +7976,13 @@ fn switchExpr(
                     return astgen.failTok(payload_token, "pointer modifier invalid on discard", .{});
                 }
                 capture = .none;
-                payload_sub_scope = &case_scope.base;
+                payload_sub_scope = &scratch_scope.base;
             } else {
                 const capture_name = try astgen.identAsString(ident);
-                try astgen.detectLocalShadowing(&case_scope.base, capture_name, ident, ident_slice, .capture);
+                try astgen.detectLocalShadowing(&scratch_scope.base, capture_name, ident, ident_slice, .capture);
                 capture_val_scope = .{
-                    .parent = &case_scope.base,
-                    .gen_zir = &case_scope,
+                    .parent = &scratch_scope.base,
+                    .gen_zir = &scratch_scope,
                     .name = capture_name,
                     .inst = switch_block.toRef(),
                     .token_src = ident,
@@ -7906,16 +7996,14 @@ fn switchExpr(
             const tag_token = if (tree.tokenTag(ident + 1) == .comma)
                 ident + 2
             else if (capture == .none) {
-                // discarding the capture is only valid iff the tag is captured
+                // discarding the capture is only valid if the tag is captured
                 // whether the tag capture is discarded is handled below
                 return astgen.failTok(payload_token, "discard of capture; omit it instead", .{});
-            } else break :blk payload_sub_scope;
+            } else break :scope payload_sub_scope;
 
             const tag_slice = tree.tokenSlice(tag_token);
             if (mem.eql(u8, tag_slice, "_")) {
                 return astgen.failTok(tag_token, "discard of tag capture; omit it instead", .{});
-            } else if (case.inline_token == null) {
-                return astgen.failTok(tag_token, "tag capture on non-inline prong", .{});
             }
             const tag_name = try astgen.identAsString(tag_token);
             try astgen.detectLocalShadowing(payload_sub_scope, tag_name, tag_token, tag_slice, .@"switch tag capture");
@@ -7925,7 +8013,7 @@ fn switchExpr(
 
             tag_scope = .{
                 .parent = payload_sub_scope,
-                .gen_zir = &case_scope,
+                .gen_zir = &scratch_scope,
                 .name = tag_name,
                 .inst = tag_inst.toRef(),
                 .token_src = tag_token,
@@ -7933,113 +8021,72 @@ fn switchExpr(
             };
             dbg_var_tag_name = tag_name;
             dbg_var_tag_inst = tag_inst.toRef();
-            break :blk &tag_scope.base;
+            break :scope &tag_scope.base;
         };
 
-        const header_index: u32 = @intCast(payloads.items.len);
-        const body_len_index = if (is_multi_case) blk: {
-            if (case_node.toOptional() == underscore_case_node) {
-                payloads.items[under_case_index] = header_index;
-                if (special_prongs.hasOneAdditionalItem()) {
-                    try payloads.resize(gpa, header_index + 2); // item, body_len
-                    const maybe_item_node = case.ast.values[0];
-                    const item_node = if (maybe_item_node.toOptional() == underscore_node)
-                        case.ast.values[1]
-                    else
-                        maybe_item_node;
-                    const item_inst = try comptimeExpr(parent_gz, scope, item_ri, item_node, .switch_item);
-                    payloads.items[header_index] = @intFromEnum(item_inst);
-                    break :blk header_index + 1;
-                }
-            } else {
-                payloads.items[multi_case_table + multi_case_index] = header_index;
-                multi_case_index += 1;
-            }
-            try payloads.resize(gpa, header_index + 3); // items_len, ranges_len, body_len
-
-            // items
-            var items_len: u32 = 0;
-            for (case.ast.values) |item_node| {
-                if (item_node.toOptional() == underscore_node or
-                    tree.nodeTag(item_node) == .switch_range)
-                {
-                    continue;
-                }
-                items_len += 1;
-
-                const item_inst = try comptimeExpr(parent_gz, scope, item_ri, item_node, .switch_item);
-                try payloads.append(gpa, @intFromEnum(item_inst));
-            }
-
-            // ranges
-            var ranges_len: u32 = 0;
-            for (case.ast.values) |range| {
-                if (tree.nodeTag(range) != .switch_range) {
-                    continue;
-                }
-                ranges_len += 1;
-
-                const first_node, const last_node = tree.nodeData(range).node_and_node;
-                const first = try comptimeExpr(parent_gz, scope, item_ri, first_node, .switch_item);
-                const last = try comptimeExpr(parent_gz, scope, item_ri, last_node, .switch_item);
-                try payloads.appendSlice(gpa, &[_]u32{
-                    @intFromEnum(first), @intFromEnum(last),
-                });
-            }
-
-            payloads.items[header_index] = items_len;
-            payloads.items[header_index + 1] = ranges_len;
-            break :blk header_index + 2;
-        } else if (case_node.toOptional() == else_case_node) blk: {
-            payloads.items[else_case_index] = header_index;
-            try payloads.resize(gpa, header_index + 1); // body_len
-            break :blk header_index;
-        } else if (case_node.toOptional() == underscore_case_node) blk: {
-            assert(!special_prongs.hasAdditionalItems());
-            payloads.items[under_case_index] = header_index;
-            try payloads.resize(gpa, header_index + 1); // body_len
-            break :blk header_index;
-        } else blk: {
-            payloads.items[scalar_case_table + scalar_case_index] = header_index;
-            scalar_case_index += 1;
-            try payloads.resize(gpa, header_index + 2); // item, body_len
-            const item_node = case.ast.values[0];
-            const item_inst = try comptimeExpr(parent_gz, scope, item_ri, item_node, .switch_item);
-            payloads.items[header_index] = @intFromEnum(item_inst);
-            break :blk header_index + 1;
-        };
-
-        {
+        prong_body: {
             // temporarily stack case_scope on parent_gz
-            case_scope.instructions_top = parent_gz.instructions.items.len;
-            defer case_scope.unstack();
+            scratch_scope.instructions_top = parent_gz.instructions.items.len;
+            defer scratch_scope.unstack();
 
             if (dbg_var_name != .empty) {
-                try case_scope.addDbgVar(.dbg_var_val, dbg_var_name, dbg_var_inst);
+                try scratch_scope.addDbgVar(.dbg_var_val, dbg_var_name, dbg_var_inst);
             }
             if (dbg_var_tag_name != .empty) {
-                try case_scope.addDbgVar(.dbg_var_val, dbg_var_tag_name, dbg_var_tag_inst);
+                try scratch_scope.addDbgVar(.dbg_var_val, dbg_var_tag_name, dbg_var_tag_inst);
             }
             const target_expr_node = case.ast.target_expr;
-            const case_result = try fullBodyExpr(&case_scope, sub_scope, block_scope.break_result_info, target_expr_node, .allow_branch_hint);
-            try checkUsed(parent_gz, &case_scope.base, sub_scope);
-            if (!parent_gz.refIsNoReturn(case_result)) {
-                _ = try case_scope.addBreakWithSrcNode(.@"break", switch_block, case_result, target_expr_node);
+            const case_result = try fullBodyExpr(&scratch_scope, prong_body_scope, block_scope.break_result_info, target_expr_node, .allow_branch_hint);
+            try checkUsed(parent_gz, &scratch_scope.base, prong_body_scope);
+            if (!scratch_scope.endsWithNoReturn()) {
+                _ = try scratch_scope.addBreakWithSrcNode(.@"break", switch_block, case_result, target_expr_node);
             }
 
-            const case_slice = case_scope.instructionsSlice();
+            const case_slice = scratch_scope.instructionsSlice();
             const extra_insts: []const Zir.Inst.Index = if (has_tag_capture) &.{ switch_block, tag_inst } else &.{switch_block};
             const body_len = astgen.countBodyLenAfterFixupsExtraRefs(case_slice, extra_insts);
-            try payloads.ensureUnusedCapacity(gpa, body_len);
-            payloads.items[body_len_index] = @bitCast(Zir.Inst.SwitchBlock.ProngInfo{
+            const prong_info: Zir.Inst.Switch.ProngInfo = .{
                 .body_len = @intCast(body_len),
                 .capture = capture,
                 .is_inline = case.inline_token != null,
                 .has_tag_capture = has_tag_capture,
-            });
-            appendBodyWithFixupsExtraRefsArrayList(astgen, payloads, case_slice, extra_insts);
+            };
+            const prong_body_start: u32 = @intCast(payloads.items.len);
+            try payloads.ensureUnusedCapacity(gpa, body_len);
+            astgen.appendBodyWithFixupsExtraRefsArrayList(payloads, case_slice, extra_insts);
+
+            if (case_node.toOptional() == else_case_node) {
+                assert(case.ast.values.len == 0);
+                else_extra = @bitCast(prong_info);
+                else_prong_body_start = prong_body_start;
+                break :prong_body;
+            }
+            if (case_has_under) {
+                // We're either writing under_prong_info or under_index here.
+                if (under_is_bare) {
+                    assert(case.ast.values.len == 1);
+                    under_extra = @bitCast(prong_info);
+                    bare_under_prong_body_start = prong_body_start;
+                    break :prong_body;
+                } else if (is_multi_case) {
+                    under_extra = scalar_cases_len + multi_case_index;
+                } else {
+                    under_extra = scalar_case_index;
+                }
+            }
+            if (is_multi_case) {
+                payloads.items[multi_prong_body_table + multi_case_index] = prong_body_start;
+                payloads.items[multi_prong_infos_start + multi_case_index] = @bitCast(prong_info);
+                multi_case_index += 1;
+            } else {
+                // prong body start is implicit, it's right behind our only item.
+                payloads.items[scalar_prong_infos_start + scalar_case_index] = @bitCast(prong_info);
+                scalar_case_index += 1;
+            }
         }
     }
+    assert(scalar_case_index + multi_case_index + @intFromBool(has_else) + @intFromBool(under_is_bare) == case_nodes.len);
+    assert(multi_bodies_lens_start + multi_item_offset == bodies_start);
 
     if (switch_full.label_token) |label_token| if (!block_scope.label.?.used) {
         try astgen.appendErrorTok(label_token, "unused switch label", .{});
@@ -8048,80 +8095,76 @@ fn switchExpr(
     // Now that the item expressions are generated we can add this.
     try parent_gz.instructions.append(gpa, switch_block);
 
-    try astgen.extra.ensureUnusedCapacity(gpa, @typeInfo(Zir.Inst.SwitchBlock).@"struct".fields.len +
-        @intFromBool(multi_cases_len != 0) +
-        @intFromBool(any_has_tag_capture) +
-        payloads.items.len - scratch_top);
+    // We're done with collecting all of the data we need! Now we just have to
+    // finalize it by copying our bodies from `payloads` to `extra` while fixing
+    // their order.
 
-    const payload_index = astgen.addExtraAssumeCapacity(Zir.Inst.SwitchBlock{
+    try astgen.extra.ensureUnusedCapacity(gpa, @typeInfo(Zir.Inst.Switch).@"struct".fields.len +
+        @intFromBool(multi_cases_len > 0) + // multi_cases_len
+        @intFromBool(any_has_tag_capture) + // tag_capture_inst
+        @intFromBool(has_else) + // else_prong_info
+        @intFromBool(has_under) + // under_prong_info or under_index
+        payloads.items.len - body_table_end);
+
+    const zir_payload_index = astgen.addExtraAssumeCapacity(Zir.Inst.Switch{
         .operand = raw_operand,
-        .bits = Zir.Inst.SwitchBlock.Bits{
-            .has_multi_cases = multi_cases_len != 0,
-            .special_prongs = special_prongs,
+        .bits = .{
+            .has_multi_cases = multi_cases_len > 0,
+            .any_ranges = any_ranges,
+            .has_else = has_else,
+            .has_under = has_under,
+            .under_has_additional_items = !under_is_bare,
             .any_has_tag_capture = any_has_tag_capture,
             .any_non_inline_capture = any_non_inline_capture,
             .has_continue = switch_full.label_token != null and block_scope.label.?.used_for_continue,
             .scalar_cases_len = @intCast(scalar_cases_len),
         },
     });
+    astgen.instructions.items(.data)[@intFromEnum(switch_block)].pl_node.payload_index = zir_payload_index;
 
-    if (multi_cases_len != 0) {
-        astgen.extra.appendAssumeCapacity(multi_cases_len);
-    }
+    if (multi_cases_len > 0) astgen.extra.appendAssumeCapacity(multi_cases_len);
+    if (any_has_tag_capture) astgen.extra.appendAssumeCapacity(@intFromEnum(tag_inst));
+    if (has_else) astgen.extra.appendAssumeCapacity(else_extra);
+    if (has_under) astgen.extra.appendAssumeCapacity(under_extra);
 
-    if (any_has_tag_capture) {
-        astgen.extra.appendAssumeCapacity(@intFromEnum(tag_inst));
-    }
-
-    const zir_datas = astgen.instructions.items(.data);
-    zir_datas[@intFromEnum(switch_block)].pl_node.payload_index = payload_index;
+    // body lens
+    astgen.extra.appendSliceAssumeCapacity(payloads.items[body_table_end..bodies_start]);
 
     if (has_else) {
-        const start_index = payloads.items[else_case_index];
-        var end_index = start_index + 1;
-        const prong_info: Zir.Inst.SwitchBlock.ProngInfo = @bitCast(payloads.items[start_index]);
-        end_index += prong_info.body_len;
-        astgen.extra.appendSliceAssumeCapacity(payloads.items[start_index..end_index]);
+        const prong_info: Zir.Inst.Switch.ProngInfo = @bitCast(else_extra);
+        const body = payloads.items[else_prong_body_start..][0..prong_info.body_len];
+        astgen.extra.appendSliceAssumeCapacity(body);
     }
-    if (has_under) {
-        const start_index = payloads.items[under_case_index];
-        var body_len_index = start_index;
-        var end_index = start_index;
-        switch (underscore_additional_items) {
-            .none => {
-                end_index += 1;
-            },
-            .one => {
-                body_len_index += 1;
-                end_index += 2;
-            },
-            .many => {
-                body_len_index += 2;
-                const items_len = payloads.items[start_index];
-                const ranges_len = payloads.items[start_index + 1];
-                end_index += 3 + items_len + 2 * ranges_len;
-            },
-        }
-        const prong_info: Zir.Inst.SwitchBlock.ProngInfo = @bitCast(payloads.items[body_len_index]);
-        end_index += prong_info.body_len;
-        astgen.extra.appendSliceAssumeCapacity(payloads.items[start_index..end_index]);
+    if (under_is_bare) {
+        const prong_info: Zir.Inst.Switch.ProngInfo = @bitCast(under_extra);
+        const body = payloads.items[bare_under_prong_body_start..][0..prong_info.body_len];
+        astgen.extra.appendSliceAssumeCapacity(body);
     }
-    for (payloads.items[scalar_case_table..case_table_end], 0..) |start_index, i| {
-        var body_len_index = start_index;
-        var end_index = start_index;
-        const table_index = scalar_case_table + i;
-        if (table_index < multi_case_table) {
-            body_len_index += 1;
-            end_index += 2;
-        } else {
-            body_len_index += 2;
-            const items_len = payloads.items[start_index];
-            const ranges_len = payloads.items[start_index + 1];
-            end_index += 3 + items_len + 2 * ranges_len;
+    for (payloads.items[scalar_body_table..][0..scalar_cases_len], 0..) |payload_start, scalar_i| {
+        const item_body_len = payloads.items[scalar_item_body_lens_start + scalar_i];
+        const prong_info: Zir.Inst.Switch.ProngInfo = @bitCast(payloads.items[scalar_prong_infos_start + scalar_i]);
+        const bodies = payloads.items[payload_start..][0 .. item_body_len + prong_info.body_len];
+        astgen.extra.appendSliceAssumeCapacity(bodies);
+    }
+    var multi_item_i: usize = 0;
+    for (0..multi_cases_len) |multi_i| {
+        const items_len = payloads.items[multi_case_items_lens_start + multi_i];
+        const ranges_len = if (any_ranges) blk: {
+            break :blk payloads.items[multi_case_ranges_lens_start + multi_i];
+        } else 0;
+        // The table entries and body lens are already in the correct order so we
+        // don't have to differentiate between items and ranges here.
+        for (0..items_len + 2 * ranges_len) |_| {
+            const body_start = payloads.items[multi_item_body_table + multi_item_i];
+            const body_len = payloads.items[multi_bodies_lens_start + multi_item_i];
+            multi_item_i += 1;
+            const body = payloads.items[body_start..][0..body_len];
+            astgen.extra.appendSliceAssumeCapacity(body);
         }
-        const prong_info: Zir.Inst.SwitchBlock.ProngInfo = @bitCast(payloads.items[body_len_index]);
-        end_index += prong_info.body_len;
-        astgen.extra.appendSliceAssumeCapacity(payloads.items[start_index..end_index]);
+        const prong_body_start = payloads.items[multi_prong_body_table + multi_i];
+        const prong_info: Zir.Inst.Switch.ProngInfo = @bitCast(payloads.items[multi_prong_infos_start + multi_i]);
+        const prong_body = payloads.items[prong_body_start..][0..prong_info.body_len];
+        astgen.extra.appendSliceAssumeCapacity(prong_body);
     }
 
     if (need_result_rvalue) {
